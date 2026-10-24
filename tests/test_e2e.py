@@ -34,6 +34,12 @@ def lake(tmp_path_factory):
     return path
 
 
+def test_nan_is_rejected_at_the_source(lake):
+    """A NUMERIC NaN would kill the Debezium task (precise decimal mode); the lab keeps it out with a CHECK."""
+    with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.errors.CheckViolation):
+        c.execute("INSERT INTO public.accounts (id, name, balance, notes) VALUES (900001, 'nan', 'NaN', 'x')")
+
+
 def test_snapshot_then_streaming_matches(lake):
     cdclab("workload", "--steps", "300", "--seed", "2", "--schema-change-at", "150", lake=lake)
     cdclab("consume", "--idle-exit", "20", "--batch", "25", lake=lake)

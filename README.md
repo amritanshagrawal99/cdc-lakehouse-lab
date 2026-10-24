@@ -127,7 +127,13 @@ docker compose up -d --wait && CDCLAB_E2E=1 pytest -q tests/test_e2e.py
   the meantime survive in the lake. The stored positions must also be reset, because LSN continuity breaks.
 - **`REPLICA IDENTITY FULL` is the safer production setting.** Debezium then fills unchanged TOAST values itself. The lab
   keeps `DEFAULT` deliberately, to exercise the hard path.
-- **Not handled yet:** NUMERIC `NaN`/`Infinity`, and tables without a primary key (rejected with a clear error).
+- **NUMERIC `NaN` must be kept out of the source.** Postgres accepts `NaN` in any `NUMERIC` column, but Debezium's
+  precise decimal mode can't represent it: the connector task logs *"Got a special value (NaN/Infinity) for Decimal
+  type ... set decimal handling mode to 'string'"*, emits null for a `NOT NULL` field, fails, and fails again on every
+  restart because the same WAL record is replayed. (Tried on the live stack; recovery meant recreating the slot.) The
+  lab's tables carry `CHECK (balance <> 'NaN'::numeric)`. `Infinity` can't happen in a `NUMERIC(p, s)` column at all.
+  The alternative is `decimal.handling.mode=string`, which trades exact types for strings in the lake.
+- **Tables without a primary key** are rejected with a clear error.
 
 ## License
 
