@@ -14,17 +14,20 @@ from dataclasses import dataclass
 import psycopg
 
 DDL = """
+-- Postgres accepts NaN in any NUMERIC column, but Debezium's precise decimal mode cannot represent it: the task
+-- logs "Got a special value (NaN/Infinity) for Decimal type ... set decimal handling mode to 'string'", emits
+-- null for a NOT NULL field and FAILS, and restarting replays the same WAL record. Keep NaN out at the source.
 CREATE TABLE IF NOT EXISTS public.accounts (
     id          integer PRIMARY KEY,
     name        text NOT NULL,
-    balance     numeric(12, 2) NOT NULL,
+    balance     numeric(12, 2) NOT NULL CHECK (balance <> 'NaN'::numeric),
     updated_at  timestamp NOT NULL DEFAULT now(),
     notes       text
 );
 CREATE TABLE IF NOT EXISTS public.orders (
     order_id    bigint PRIMARY KEY,
     account_id  integer NOT NULL,
-    amount      numeric(12, 2) NOT NULL,
+    amount      numeric(12, 2) NOT NULL CHECK (amount <> 'NaN'::numeric),
     status      text NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
