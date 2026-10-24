@@ -1,0 +1,33 @@
+{
+  "name": "lab-postgres",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "postgres",
+    "database.port": "5432",
+    "database.user": "lab",
+    "database.password": "lab",
+    "database.dbname": "lab",
+    "topic.prefix": "lab",
+    "plugin.name": "pgoutput",
+    "slot.name": "lab_slot",
+    "publication.name": "lab_publication",
+    "publication.autocreate.mode": "filtered",
+    "table.include.list": "public.accounts,public.orders",
+    "snapshot.mode": "initial",
+    "decimal.handling.mode": "precise",
+    "time.precision.mode": "adaptive",
+    "tombstones.on.delete": "true",
+    "skipped.operations": "none",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "true",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true",
+    "key.converter.replace.null.with.default": "false",
+    "value.converter.replace.null.with.default": "false",
+    "heartbeat.interval.ms": "10000",
+    "slot.drop.on.stop": "false",
+    "topic.creation.default.replication.factor": "1",
+    "topic.creation.default.partitions": "1",
+    "tasks.max": "1"
+  }
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cdc-lakehouse-lab"
+version = "0.1.0"
+description = "Postgres -> Debezium -> Kafka -> Apache Iceberg with exactly-once effect, deletes, TOAST, schema evolution and reconciliation."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Amritansh Agrawal" }]
+requires-python = ">=3.10"
+dependencies = ["pyiceberg[pyarrow,sql-sqlite]>=0.12,<0.13", "confluent-kafka>=2.4", "psycopg[binary]>=3.2"]
+keywords = ["cdc", "debezium", "kafka", "iceberg", "postgres", "exactly-once", "data-engineering"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+cdclab = "cdclab.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cdclab"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
