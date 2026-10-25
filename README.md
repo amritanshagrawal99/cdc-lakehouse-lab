@@ -125,6 +125,27 @@ session times out (45 s by default).
 same way. Any other out-of-range value raises rather than being clamped. Arrays become Iceberg lists, and their TOAST
 placeholder (a one-element list) is filled like any other.
 
+## Table maintenance
+
+Every consumer batch adds a snapshot, and copy-on-write deletes rewrite each file that holds a touched key. A CDC table
+therefore piles up small files, snapshots and unreferenced files quickly. `cdclab maintain` cleans up and is safe to run
+while the consumer is writing:
+
+```bash
+cdclab maintain --dry-run                        # what it would do
+cdclab maintain                                  # compact at 32+ files, expire snapshots > 24 h (keep the last 10),
+                                                 # delete unreferenced files older than 60 min
+```
+
+| Step | Why it can't break exactly-once (each point verified in `tests/test_maintain.py`) |
+|---|---|
+| **Compact** (one overwrite) | It reads snapshot S and commits only if the table is still at S. A consumer commit in between makes it fail, and the run just skips compaction. |
+| **Expire snapshots** | Offsets and positions are table *properties*, not snapshot data. A consumer commit built on a view from before the expiry still succeeds. |
+| **Delete orphans** | pyiceberg's expiry deletes no files itself (checked), so this is where disk space comes back. A file is kept if any remaining snapshot, manifest, manifest list or metadata file references it, or if it's younger than the grace period, since an uncommitted write may own it. |
+
+The end-to-end test maintains the lake (no grace period, consumer stopped), then streams more changes, and still
+reconciles exactly.
+
 ## Tests
 
 | Suite | What it proves |
@@ -133,7 +154,8 @@ placeholder (a one-element list) is filled like any other.
 | `tests/test_sink_applier.py` | Against a real Iceberg catalog: atomic batches, crash mid-transaction leaves nothing, idempotent replay, out-of-order LSNs, truncate, TOAST from lake and from an old key, schema evolution incl. #3105 and default backfill, >200-key deletes, commit-conflict retry, replay filter |
 | `tests/test_review_findings.py` | Regressions from adversarial review: truncate-only batches, truncate replays, replay of the last PK-change pair, stale writers, interleaved-transaction positions, bytea/array placeholders, time columns, duplicate keys in reconcile, transaction-aligned batching |
 | `tests/test_review_v2.py` | Second review: type widening and refused type changes, infinity sentinels (snapshot and streaming), arrays and their TOAST placeholder, replays that start mid-batch, PK-change pairs split by a full poll (driving the real `run()` loop with a fake Kafka consumer), seek-on-assign, real commit fencing without mocks, exact float comparison in reconcile |
-| `tests/test_e2e.py` (Docker, CI) | The real stack: snapshot → streaming → reconcile; consumer killed 3× → reconcile; Kafka Connect SIGKILLed mid-workload → replays dropped → reconcile |
+| `tests/test_maintain.py` | Maintenance interleaved with the real Applier: data, offsets and positions unchanged; a stale compaction is rejected; every referenced file survives (checked on disk, because pyiceberg caches manifest lists in memory); young files kept; dry run changes nothing; keep-last-N |
+| `tests/test_e2e.py` (Docker, CI) | The real stack: snapshot → streaming → reconcile; consumer killed 3× → reconcile; Kafka Connect SIGKILLed mid-workload → replays dropped → reconcile; maintenance, then more changes → reconcile |
 
 ```bash
 pytest -q                                                        # unit tests, no Docker
@@ -145,8 +167,9 @@ docker compose up -d --wait && CDCLAB_E2E=1 pytest -q tests/test_e2e.py
 - **One writer per table.** Two consumers of the same topic are detected (commit conflict, then retry), but this isn't
   designed as a multi-writer sink.
 - **No multi-table atomicity.** Each table is exactly-once on its own; pyiceberg has no multi-table transactions.
-- **Copy-on-write.** pyiceberg 0.12 rewrites every data file that contains a touched key. Partition or bucket by key and
-  compact for real volumes.
+- **Copy-on-write.** pyiceberg 0.12 rewrites every data file that contains a touched key. Partition or bucket by key for
+  real volumes. `cdclab maintain` compacts by rewriting the whole table, so tables over 2 GiB are skipped (use Spark's
+  `rewrite_data_files`). Orphan cleanup supports local warehouses only.
 - **Re-snapshots don't carry deletes.** If the replication slot is lost and the connector re-snapshots, rows deleted in
   the meantime survive in the lake. The stored positions must also be reset, because LSN continuity breaks.
 - **`REPLICA IDENTITY FULL` is the safer production setting.** Debezium then fills unchanged TOAST values itself. The lab

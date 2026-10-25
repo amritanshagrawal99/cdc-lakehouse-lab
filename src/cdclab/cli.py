@@ -115,6 +115,17 @@ def cmd_reconcile(a) -> int:
     return 0 if ok else 1
 
 
+def cmd_maintain(a) -> int:
+    from .maintain import maintain
+    from .sink import IcebergSink
+    sink = IcebergSink(catalog(a.lake))
+    for table in TABLES:
+        r = maintain(sink, table, retain_hours=a.retain_hours, keep_last=a.keep_last, compact_min_files=a.compact_min_files,
+                     grace_minutes=a.grace_minutes, dry_run=a.dry_run)
+        print(r.describe() if r else f"{table}: not in the lake yet")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     p = argparse.ArgumentParser(prog="cdclab", description="Postgres -> Debezium -> Kafka -> Iceberg, exactly once.")
@@ -141,6 +152,14 @@ def main(argv: list[str] | None = None) -> int:
     c.set_defaults(func=cmd_consume)
     rc = sub.add_parser("reconcile", help="compare every source table with its Iceberg copy")
     rc.set_defaults(func=cmd_reconcile)
+    m = sub.add_parser("maintain", help="compact, expire snapshots and delete orphan files (safe while consuming)")
+    m.add_argument("--retain-hours", type=float, default=24, help="expire snapshots older than this")
+    m.add_argument("--keep-last", type=int, default=10, help="always keep this many newest snapshots")
+    m.add_argument("--compact-min-files", type=int, default=32, help="rewrite the table when it has this many data files")
+    m.add_argument("--grace-minutes", type=float, default=60,
+                   help="never delete unreferenced files younger than this (a commit may be in flight)")
+    m.add_argument("--dry-run", action="store_true")
+    m.set_defaults(func=cmd_maintain)
     a = p.parse_args(argv)
     return a.func(a)
 

@@ -101,3 +101,15 @@ def test_kafka_connect_crash_replays_are_absorbed(lake):
     print(r.stderr[-1500:])
     r = cdclab("reconcile", lake=lake)
     assert_all_match(r)
+
+
+def test_maintenance_between_runs_keeps_exactly_once(lake):
+    """Compact, expire every old snapshot and delete orphans (no grace: the consumer is stopped), then stream more
+    changes into the maintained tables. Offsets and positions live in table properties, so nothing is replayed
+    twice or skipped."""
+    r = cdclab("maintain", "--retain-hours", "0", "--keep-last", "1", "--grace-minutes", "0",
+               "--compact-min-files", "2", lake=lake)
+    assert "(compacted)" in r.stdout and "orphan files" in r.stdout, r.stdout
+    cdclab("workload", "--steps", "150", "--seed", "5", "--schema-change-at", "-1", lake=lake)
+    cdclab("consume", "--idle-exit", "20", "--batch", "40", lake=lake)
+    assert_all_match(cdclab("reconcile", lake=lake))
