@@ -103,8 +103,14 @@ too: partitions are consumed at different rates, and on the live stack the creat
 had delivered the insert of its old key 34, so there was no old row to copy from. Once the delete has arrived,
 everything before it in the old key's partition has too. And the batch must be **closed** under pairing: a second
 live failure came from judging pairs over the whole list, then cutting at an unrelated unpaired half that fell between
-a create and its delete. The cut is now repeated on the prefix until every pair in it is complete. The lab's topics
-have 2 partitions, so every end-to-end test runs this path.
+a create and its delete. The cut is now repeated on the prefix until every pair in it is complete.
+A third failure surfaced only after a Kafka Connect SIGKILL, in CI. Both halves were in Kafka twice, original and
+replay. The replayed create came in early and was consumed with the original pair. The replayed delete then had no
+partner left and held back every later record, in every table. So halves are matched by **(key, Debezium position)**,
+which identifies one key change. A half at or below its partition's stored position is a replay the applier drops
+anyway, so it waits for nothing. And a second delete of an already-deleted key in one batch (a replay) no longer
+erases the row state that the create copies from. The lab's topics have 2 partitions, so every end-to-end test runs
+this path.
 
 **6. Schema evolution.**
 - `ALTER TABLE ... ADD COLUMN` shows up in the next event's Connect schema and is added with `union_by_name`.

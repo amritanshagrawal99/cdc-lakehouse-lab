@@ -111,3 +111,30 @@ def test_batch_is_closed_under_pairing():
     ready, held = hold_unpaired_deletes(records)
     assert ready == [] and held == records         # cutting at b_delete would have kept a_create alone
     assert hold_unpaired_deletes([a_create, filler, a_delete, b_delete]) == ([a_create, filler, a_delete], [b_delete])
+
+
+def test_a_replayed_half_whose_partner_was_already_applied_does_not_stall(sink):
+    """Live failure #3, after a Kafka Connect SIGKILL: both halves of 35 -> 65 exist twice (original + replay). The
+    replayed create (partition 1) arrived early and was consumed with the original pair; the replayed delete
+    (partition 0) then had no partner left and held back every later record, in every table."""
+    # Empty polls between batches (an idle gap) so each batch is applied before the next one arrives.
+    fake = drive(sink, [
+        [record("c", after=row(35, notes=BIG), partition=0, offset=0, seq=(10, 100))], [],
+        [pk_delete(35, 65, partition=0, offset=1, seq=(20, 200)),
+         pk_create(35, 65, partition=1, offset=0, seq=(20, 200)),
+         pk_create(35, 65, partition=1, offset=1, seq=(20, 200))], [],             # the create's replay came early
+        [pk_delete(35, 65, partition=0, offset=2, seq=(20, 200))], [],             # the delete's replay, alone
+        [record("u", after=row(65, name="after", notes=TOAST_PLACEHOLDER), partition=1, offset=2, seq=(30, 300)),
+         record("c", after=row(70), partition=0, offset=3, seq=(40, 400))]], partitions=((T, 0), (T, 1)))
+    r = lake(sink)
+    assert set(r) == {65, 70} and r[65]["name"] == "after" and r[65]["notes"] == BIG
+    committed = {}
+    for c in fake.commits:
+        committed.update(c)
+    assert committed == {(T, 0): 4, (T, 1): 3}       # every record applied and committed: nothing left held
+
+
+def test_halves_pair_by_key_and_position():
+    d = pk_delete(35, 65, partition=0, offset=1, seq=(20, 200))
+    other_change = pk_create(35, 99, partition=1, offset=5, seq=(50, 500))     # a LATER key change of key 35
+    assert hold_unpaired_deletes([d, other_change])[0] == []                   # not d's partner

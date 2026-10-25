@@ -204,7 +204,7 @@ def _header_value(headers, name: str) -> bytes | None:
     return None
 
 
-def hold_unpaired_deletes(records: list[Record]) -> tuple[list[Record], list[Record]]:
+def hold_unpaired_deletes(records: list[Record], is_replay=None) -> tuple[list[Record], list[Record]]:
     """(records to apply now, records to hold) so that no primary-key change is split across batches.
 
     Debezium emits a primary-key change as delete(old key, header __debezium.newkey) + create(new key, header
@@ -221,30 +221,46 @@ def hold_unpaired_deletes(records: list[Record]) -> tuple[list[Record], list[Rec
     CLOSED under pairing. Judging pairs over the whole list and then cutting at the first unpaired half is not enough:
     on the live stack that cut fell between a create (kept) and its delete (held), because the halves sit in different
     partitions at unrelated positions in the list. So the cut is repeated on the prefix until it is stable. A prefix
-    also keeps, for each partition, everything before the delete half: the old key's whole history."""
+    also keeps, for each partition, everything before the delete half: the old key's whole history.
+
+    A half is identified by (topic, old key, Debezium position), the identity of one key change, so a replayed half
+    (Kafka Connect is at-least-once) pairs with whichever partner copy is present. A half that `is_replay(record)`
+    says is at or below its partition's stored position is dropped by the Applier anyway, so it waits for nothing.
+    Live failure #3: after a Connect crash the replayed create arrived early and was consumed with the ORIGINAL
+    pair, and the replayed delete then waited forever for a partner, holding back every table."""
     ready = records
-    while (cut := _first_unpaired(ready)) is not None:
+    while (cut := _first_unpaired(ready, is_replay)) is not None:
         ready = ready[:cut]
     return ready, records[len(ready):]
 
 
-def _first_unpaired(records: list[Record]) -> int | None:
-    deletes, creates = set(), set()
-    for r in records:
-        if r[1] is None or len(r) <= 5:
-            continue
-        if has_header(r[5], NEWKEY_HEADER):
-            deletes.add((r[2], _key_payload(r[0])))
-        old = _header_value(r[5], "__debezium.oldkey")
-        if old is not None:
-            creates.add((r[2], _key_payload(old)))
-    for i, r in enumerate(records):
-        if r[1] is None or len(r) <= 5:
-            continue
-        if has_header(r[5], NEWKEY_HEADER) and (r[2], _key_payload(r[0])) not in creates:
-            return i
-        old = _header_value(r[5], "__debezium.oldkey")
-        if old is not None and (r[2], _key_payload(old)) not in deletes:
+def _sequence(raw: bytes | None):
+    try:
+        return ((json.loads(raw) or {}).get("payload") or {}).get("source", {}).get("sequence")
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _halves(r: Record):
+    """('d' | 'c', pair identity) for a key-change half, else None."""
+    if r[1] is None or len(r) <= 5:
+        return None
+    if has_header(r[5], NEWKEY_HEADER):
+        return "d", (r[2], _key_payload(r[0]), _sequence(r[1]))
+    old = _header_value(r[5], "__debezium.oldkey")
+    if old is not None:
+        return "c", (r[2], _key_payload(old), _sequence(r[1]))
+    return None
+
+
+def _first_unpaired(records: list[Record], is_replay=None) -> int | None:
+    seen = {"d": set(), "c": set()}
+    halves = [_halves(r) for r in records]
+    for h in halves:
+        if h:
+            seen[h[0]].add(h[1])
+    for i, h in enumerate(halves):
+        if h and h[1] not in seen["c" if h[0] == "d" else "d"] and not (is_replay and is_replay(records[i])):
             return i
     return None
 
@@ -266,6 +282,26 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
     missing: set[str] = set()
 
     applier = Applier(sink, prefix)
+
+    def replay_check():
+        """is_replay(record) against the stored positions, read fresh for each decision (tables are cached per call)."""
+        cache: dict[str, dict] = {}
+
+        def is_replay(r: Record) -> bool:
+            table = topic_table(r[2], prefix)
+            if table not in cache:
+                t = sink.load(table)
+                cache[table] = stored_state(t.properties)[1] if t is not None else {}
+            high = cache[table].get((r[2], r[3]))
+            seq = _sequence(r[1])
+            if high is None or not seq:
+                return False
+            try:
+                a, b = json.loads(seq) if isinstance(seq, str) else seq
+                return (int(a), int(b)) <= high
+            except (TypeError, ValueError):
+                return False
+        return is_replay
 
     def on_assign(consumer, partitions):  # noqa: ARG001 - signature fixed by confluent-kafka
         for tp in partitions:
@@ -303,7 +339,7 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
             new = [(m.key(), m.value(), m.topic(), m.partition(), m.offset(), m.headers()) for m in data]
             if not new:
                 # Nothing more is coming: the held transaction is complete, except a PK change missing its create.
-                ready, held = hold_unpaired_deletes(held)
+                ready, held = hold_unpaired_deletes(held, replay_check())
                 if not ready:
                     if held and held_since is not None and time.monotonic() - held_since > 30:
                         log.warning("holding %s records: a primary-key change's create half has not arrived", len(held))
@@ -316,7 +352,7 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
             else:
                 last = time.monotonic()
                 ready, held = split_trailing_transaction(held + new, full=len(new) == batch)
-                ready, unpaired = hold_unpaired_deletes(ready)   # never a PK-change delete without its create
+                ready, unpaired = hold_unpaired_deletes(ready, replay_check())   # never half a key change
                 held = unpaired + held
             held_since = time.monotonic() if held else None
             for r in applier.apply(ready):
@@ -329,5 +365,28 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
                 c.commit(offsets=[TopicPartition(t, p, o) for (t, p), o in applied_offsets(ready).items()],
                          asynchronous=False)
     finally:
+        if held:
+            log.warning("exiting with %s records held back; unpaired primary-key-change halves: %s", len(held),
+                        describe_unpaired(held))
         c.close()
     return applier.commits
+
+
+def describe_unpaired(records: list[Record], limit: int = 5) -> list[str]:
+    """Human-readable list of key-change halves in `records` whose partner is not there (for logs)."""
+    out = []
+    rest = list(records)
+    while rest and len(out) < limit:
+        i = _first_unpaired(rest)
+        if i is None:
+            break
+        r = rest[i]
+        try:
+            v = json.loads(r[1]).get("payload") or {}
+            op, seq = v.get("op"), (v.get("source") or {}).get("sequence")
+        except (TypeError, ValueError):
+            op, seq = "?", None
+        out.append(f"{r[2]}[{r[3]}]@{r[4]} op={op} key={_key_payload(r[0])} "
+                   f"oldkey={_key_payload(_header_value(r[5], '__debezium.oldkey'))} sequence={seq}")
+        rest = rest[i + 1:]
+    return out
