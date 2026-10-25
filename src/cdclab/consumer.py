@@ -101,9 +101,11 @@ class Applier:
                 if ev is None:
                     continue
                 if ev.position is not None:
-                    # Compared with the position stored BEFORE this batch: a replayed event is at or below it.
-                    # Ties within the batch (both halves of a primary-key change) are above it and pass.
-                    if tp in stored_high and ev.position <= stored_high[tp]:
+                    # Positions never decrease in emission order, so a replayed event is (a) at or below the position
+                    # stored BEFORE this batch, or (b) strictly below one already seen in this batch (the replay
+                    # started inside the batch). Ties within the batch pass: both halves of a primary-key change
+                    # share one position.
+                    if (tp in stored_high and ev.position <= stored_high[tp]) or (tp in high and ev.position < high[tp]):
                         skipped += 1
                         continue
                     high[tp] = max(ev.position, high.get(tp, ev.position))
@@ -169,21 +171,41 @@ def applied_offsets(records: list[Record]) -> dict[tuple[str, int], int]:
     return out
 
 
-def awaiting_create_half(records: list[Record]) -> bool:
-    """True if the last change event is the delete half of a primary-key change whose create half has not arrived.
-    Such a delete must never be applied alone: the create may carry TOAST placeholders only the old row can fill."""
-    for r in reversed(records):
+def hold_unpaired_deletes(records: list[Record]) -> tuple[list[Record], list[Record]]:
+    """(records to apply now, records to hold) so that no primary-key change is split.
+
+    Debezium emits a primary-key change as delete(old key, header __debezium.newkey) immediately followed, in the same
+    partition, by create(new key). If a partition's last change event is such a delete, its create half has not
+    arrived. The delete must not be applied alone: the create may carry TOAST placeholders that only the old row can
+    fill, and both halves share one Debezium position, so a create arriving in a later batch would be dropped as a
+    replay. Everything from the earliest such delete onward is held. This applies however the batch was cut (a poll
+    that filled up, a held transaction flushed on an idle poll, several topics in one poll)."""
+    last: dict[tuple[str, int], int] = {}
+    for i, r in enumerate(records):
         if r[1] is not None:
-            return has_header(r[5] if len(r) > 5 else None, NEWKEY_HEADER)
-    return False
+            last[(r[2], r[3])] = i
+    cuts = [i for i in last.values() if has_header(records[i][5] if len(records[i]) > 5 else None, NEWKEY_HEADER)]
+    if not cuts:
+        return records, []
+    cut = min(cuts)
+    return records[:cut], records[cut:]
+
+
+def awaiting_create_half(records: list[Record]) -> bool:
+    """True if some partition's last change event is a primary-key-change delete whose create half has not arrived."""
+    return bool(hold_unpaired_deletes(records)[1])
 
 
 def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group: str = "cdclab",
-        batch: int = 500, idle_exit_s: float | None = None) -> int:
-    """Consume until idle for `idle_exit_s` seconds (None = forever). Returns the number of Iceberg commits."""
+        batch: int = 500, idle_exit_s: float | None = None, consumer_factory=None) -> int:
+    """Consume until idle for `idle_exit_s` seconds (None = forever). Returns the number of Iceberg commits.
+    `consumer_factory(config)` defaults to confluent_kafka.Consumer; tests pass a fake."""
     import time
 
-    from confluent_kafka import OFFSET_BEGINNING, Consumer, KafkaException, TopicPartition
+    from confluent_kafka import OFFSET_BEGINNING, Consumer, KafkaError, KafkaException, TopicPartition
+
+    MISSING_TOPIC = (KafkaError.UNKNOWN_TOPIC_OR_PART, KafkaError._UNKNOWN_TOPIC)
+    missing: set[str] = set()
 
     applier = Applier(sink, prefix)
 
@@ -195,7 +217,7 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
         consumer.assign(partitions)
         assigned.update((tp.topic, tp.partition) for tp in partitions)
 
-    c = Consumer({"bootstrap.servers": bootstrap, "group.id": group, "enable.auto.commit": False,
+    c = (consumer_factory or Consumer)({"bootstrap.servers": bootstrap, "group.id": group, "enable.auto.commit": False,
                   "auto.offset.reset": "error",   # never silently skip data lost to retention
                   "isolation.level": "read_committed",
                   # A crashed consumer never leaves the group; its partitions only move after this timeout.
@@ -208,14 +230,23 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
     try:
         while True:
             msgs = c.consume(num_messages=batch, timeout=1.0)
+            data = []
             for m in msgs:
-                if m.error() is not None:
-                    raise KafkaException(m.error())   # e.g. auto.offset.reset=error: the stored offset is gone
-            new = [(m.key(), m.value(), m.topic(), m.partition(), m.offset(), m.headers()) for m in msgs]
-            if not new:
-                if held and not awaiting_create_half(held):
-                    ready, held = held, []        # nothing more is coming: the held transaction is complete
+                err = m.error()
+                if err is None:
+                    data.append(m)
+                elif err.code() in MISSING_TOPIC and not err.fatal():
+                    # A table with no changes yet has no topic; Debezium creates it with the first event.
+                    if m.topic() not in missing:
+                        log.info("topic %s does not exist yet; it will be picked up when it does", m.topic())
+                        missing.add(m.topic())
                 else:
+                    raise KafkaException(err)   # e.g. auto.offset.reset=error: the stored offset is gone
+            new = [(m.key(), m.value(), m.topic(), m.partition(), m.offset(), m.headers()) for m in data]
+            if not new:
+                # Nothing more is coming: the held transaction is complete, except a PK change missing its create.
+                ready, held = hold_unpaired_deletes(held)
+                if not ready:
                     if held and held_since is not None and time.monotonic() - held_since > 30:
                         log.warning("holding %s records: a primary-key change's create half has not arrived", len(held))
                         held_since = time.monotonic()
@@ -226,9 +257,9 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
                     continue
             else:
                 last = time.monotonic()
-                ready, held = split_trailing_transaction(held + new, full=len(msgs) == batch)
-                if held and awaiting_create_half(ready):
-                    ready, held = [], ready + held   # never let a PK-change delete through without its create
+                ready, held = split_trailing_transaction(held + new, full=len(new) == batch)
+                ready, unpaired = hold_unpaired_deletes(ready)   # never a PK-change delete without its create
+                held = unpaired + held
             held_since = time.monotonic() if held else None
             for r in applier.apply(ready):
                 log.info("%s: +%s upserts, -%s deletes%s%s%s", r.table, r.upserted, r.deleted_keys,

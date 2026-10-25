@@ -29,9 +29,13 @@ cdclab register                              # Debezium connector, waits until R
 cdclab workload --steps 300                  # the hard cases (below), incl. ALTER TABLE ADD COLUMN mid-stream
 cdclab consume --idle-exit 20                # apply to Iceberg (local SQL catalog in ./lake)
 cdclab reconcile
-# MATCH  public.accounts: 68 rows
-# MATCH  public.orders: 29 rows
+# MATCH  public.accounts: 78 rows
+# MATCH  public.orders: 26 rows
+# MATCH  public.edge_types: 19 rows
 ```
+
+`edge_types` carries the values that break naive pipelines: `±infinity` timestamps and dates, arrays (one of them large
+enough to be TOASTed), `jsonb`, `uuid`, `real`, and two `ALTER COLUMN ... TYPE` widenings mid-stream.
 
 ## What makes CDC into a lakehouse hard, and what this does about it
 
@@ -55,8 +59,9 @@ before its Kafka commit, and the result still matches exactly.
 re-emits events at **new** Kafka offsets, so offsets alone can't catch them. Re-applying them is usually harmless
 (last-writer-wins), but not when an unchanged TOAST value is filled from current lake state (item 5).
 → A per-partition high-water mark on Debezium's `source.sequence` = `(lastCommitLsn, lsn)` is stored with the offsets.
-That pair never decreases in emission order, so a replayed event is at or below the mark stored *before its batch* and
-is dropped. Ties inside a batch pass, because both halves of a primary-key change share one position, and the batching
+That pair never decreases in emission order. A replayed event is therefore at or below the mark stored *before its
+batch*, or strictly below a position already seen *in* its batch (the replay began mid-batch). Either way it is
+dropped. Ties inside a batch pass, because both halves of a primary-key change share one position, and the batching
 rule below keeps those halves in one batch. Snapshot reads (`op=r`) have no position and bypass the filter.
 → `test_kafka_connect_crash_replays_are_absorbed` SIGKILLs Kafka Connect mid-workload. In a typical run, about 300
 replayed events are dropped and the tables still match.
@@ -80,8 +85,10 @@ fresh load. A stale in-memory copy of the offsets could otherwise apply a batch 
 - A batch boundary must never split that pair. Every poll therefore holds back its trailing source transaction until
   more records arrive, or until a poll comes back empty (Debezium emits a transaction's events together, so an idle
   poll means the held transaction is complete). The one exception: a delete carrying `__debezium.newkey` is never
-  applied without its create half, however long that takes. As a side effect each source transaction lands in one
-  commit per table.
+  applied without its create half, however long that takes. That holds however the batch was cut: a poll that filled
+  up, a flush on an idle poll, or several partitions in one poll. Applied alone, the delete would store the pair's
+  shared position, and the create would then be dropped as a replay. As a side effect each source transaction lands in
+  one commit per table.
 
 **6. Schema evolution.**
 - `ALTER TABLE ... ADD COLUMN` shows up in the next event's Connect schema and is added with `union_by_name`.
@@ -90,6 +97,11 @@ fresh load. A stale in-memory copy of the offsets could otherwise apply a batch 
 - `ADD COLUMN ... DEFAULT x` gives every existing *source* row `x`, but Debezium emits nothing for those rows. The sink
   backfills `x` into existing lake rows, and into rows whose last event predates the column.
 - Debezium exports *function* defaults such as `now()` as the epoch. Those are not trusted.
+- `ALTER COLUMN ... TYPE` keeps the column name, so it is detected by type: a source type the lake column can't hold
+  is widened in place where Iceberg allows it (int → long, float → double, decimal precision). Before that, values over
+  2³¹ crashed the batch on every retry. Changes Iceberg can't apply stop the consumer with an error naming the column,
+  before anything is written. These are a decimal *scale* change, which `union_by_name` would silently ignore, a
+  different type family (e.g. a column dropped and re-added as `int`), and `timestamp` ↔ `timestamptz`.
 
 **7. Defaults that silently diverge.**
 - Debezium skips `TRUNCATE` unless `skipped.operations=none`.
@@ -102,6 +114,17 @@ rest of the batch".
 session times out (45 s by default).
 → `session.timeout.ms=10000`. The idle-exit timer only starts once partitions are assigned.
 
+**9. Debezium's encodings are not always what the docs say.** All of these were observed on Debezium 3.7.0.Final:
+- JsonConverter names `real` / `double precision` as `float` / `double`, not `float32` / `float64`.
+- `±infinity` arrives as a sentinel that differs by type. Microsecond timestamps use `Long.MAX/MIN`. Millisecond
+  timestamps use the documented `9223372036825200000`. `timestamptz` uses the strings `"infinity"`. Dates use one pair
+  of day counts when streaming and *another* in the initial snapshot, where `+infinity` comes out as a large negative
+  number.
+
+→ Each sentinel maps to `datetime.max` / `datetime.min` (or `date.max` / `date.min`), and reconcile loads the source the
+same way. Any other out-of-range value raises rather than being clamped. Arrays become Iceberg lists, and their TOAST
+placeholder (a one-element list) is filled like any other.
+
 ## Tests
 
 | Suite | What it proves |
@@ -109,6 +132,7 @@ session times out (45 s by default).
 | `tests/test_events_compact.py` | Exact decoding of Connect logical types (decimal bytes, micro/milli/zoned timestamps, dates, times), compaction rules, TOAST, PK changes, function-default guard |
 | `tests/test_sink_applier.py` | Against a real Iceberg catalog: atomic batches, crash mid-transaction leaves nothing, idempotent replay, out-of-order LSNs, truncate, TOAST from lake and from an old key, schema evolution incl. #3105 and default backfill, >200-key deletes, commit-conflict retry, replay filter |
 | `tests/test_review_findings.py` | Regressions from adversarial review: truncate-only batches, truncate replays, replay of the last PK-change pair, stale writers, interleaved-transaction positions, bytea/array placeholders, time columns, duplicate keys in reconcile, transaction-aligned batching |
+| `tests/test_review_v2.py` | Second review: type widening and refused type changes, infinity sentinels (snapshot and streaming), arrays and their TOAST placeholder, replays that start mid-batch, PK-change pairs split by a full poll (driving the real `run()` loop with a fake Kafka consumer), seek-on-assign, real commit fencing without mocks, exact float comparison in reconcile |
 | `tests/test_e2e.py` (Docker, CI) | The real stack: snapshot → streaming → reconcile; consumer killed 3× → reconcile; Kafka Connect SIGKILLed mid-workload → replays dropped → reconcile |
 
 ```bash
@@ -134,6 +158,12 @@ docker compose up -d --wait && CDCLAB_E2E=1 pytest -q tests/test_e2e.py
   lab's tables carry `CHECK (balance <> 'NaN'::numeric)`. `Infinity` can't happen in a `NUMERIC(p, s)` column at all.
   The alternative is `decimal.handling.mode=string`, which trades exact types for strings in the lake.
 - **Tables without a primary key** are rejected with a clear error.
+- **`DROP COLUMN` is not propagated.** The lake keeps the column: rows written afterwards get NULL, older rows keep their
+  last value. Reconcile only compares the source's columns, so it doesn't flag this.
+- **`±infinity` becomes the largest / smallest Python value.** A real `9999-12-31 23:59:59.999999` is indistinguishable
+  from `infinity` in the lake.
+- **Not supported:** nested arrays, `map` types, `NUMERIC` without a scale (`VariableScaleDecimal`). Each fails with an
+  error naming the column.
 
 ## License
 
