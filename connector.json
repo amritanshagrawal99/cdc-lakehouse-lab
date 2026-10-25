@@ -27,7 +27,7 @@
     "heartbeat.interval.ms": "10000",
     "slot.drop.on.stop": "false",
     "topic.creation.default.replication.factor": "1",
-    "topic.creation.default.partitions": "1",
+    "topic.creation.default.partitions": "2",
     "tasks.max": "1"
   }
 }

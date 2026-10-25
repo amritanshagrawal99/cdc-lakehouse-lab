@@ -57,7 +57,10 @@ def compact(events: list[ChangeEvent]) -> dict[str, TablePlan]:
             if k in plan.upserts:
                 dead[k] = (plan.upserts.pop(k), plan.fill_from_table.pop(k, set()), plan.fill_source.pop(k, k))
             else:
-                dead[k] = (None, set(), k)   # the row's last state is in the lake (if anywhere)
+                # The row's last state is in the lake (if anywhere), unless this key was already deleted in this
+                # batch: a second delete without a create in between is a replay (Connect is at-least-once) and must
+                # not erase the state a primary-key change's create still has to copy from.
+                dead.setdefault(k, (None, set(), k))
             plan.deletes.add(k)
             continue
         if ev.op not in ("c", "u", "r"):

@@ -10,7 +10,7 @@ column for column. The repo includes the workload that makes CDC hard and the te
 ```mermaid
 flowchart LR
     PG[(Postgres 16<br/>wal_level=logical)] -->|pgoutput| DBZ[Debezium 3.7<br/>Kafka Connect]
-    DBZ -->|one topic per table<br/>JSON + Connect schema| K[(Kafka 4.3<br/>KRaft)]
+    DBZ -->|one topic per table, 2 partitions<br/>JSON + Connect schema| K[(Kafka 4.3<br/>KRaft)]
     K --> C[cdclab consumer]
     C -->|"one Iceberg commit per table per batch:<br/>delete keys + append rows + offsets + positions"| ICE[(Iceberg tables<br/>pyiceberg 0.12)]
     ICE -.->|"on start: seek to stored offset + 1"| C
@@ -90,6 +90,28 @@ fresh load. A stale in-memory copy of the offsets could otherwise apply a batch 
   shared position, and the create would then be dropped as a replay. As a side effect each source transaction lands in
   one commit per table.
 
+**5b. With several partitions, the two halves of a key change are in different partitions.** Debezium routes each
+event by its key, so the old key and the new key usually hash to different partitions. The first version paired the
+halves within one partition and compacted a batch in (partition, offset) order. On the live stack with 2 partitions,
+the consumer then failed on its first batch, on every retry: a create (copying TOAST values from the old row) was
+compacted before the insert of that old row, which sat in the other partition.
+→ Replays are still filtered in offset order per partition, the only order in which they show. Compaction then runs
+in **commit order across partitions**: snapshot rows first, then Debezium's `(lastCommitLsn, lsn)`, with the delete
+before the create on a tie. The two halves are matched **by key, per topic**, and **each waits for the other**.
+The delete waits for its create, which `__debezium.oldkey` names, in any partition. The create waits for its delete
+too: partitions are consumed at different rates, and on the live stack the create of key 95 arrived before partition 0
+had delivered the insert of its old key 34, so there was no old row to copy from. Once the delete has arrived,
+everything before it in the old key's partition has too. And the batch must be **closed** under pairing: a second
+live failure came from judging pairs over the whole list, then cutting at an unrelated unpaired half that fell between
+a create and its delete. The cut is now repeated on the prefix until every pair in it is complete.
+A third failure surfaced only after a Kafka Connect SIGKILL, in CI. Both halves were in Kafka twice, original and
+replay. The replayed create came in early and was consumed with the original pair. The replayed delete then had no
+partner left and held back every later record, in every table. So halves are matched by **(key, Debezium position)**,
+which identifies one key change. A half at or below its partition's stored position is a replay the applier drops
+anyway, so it waits for nothing. And a second delete of an already-deleted key in one batch (a replay) no longer
+erases the row state that the create copies from. The lab's topics have 2 partitions, so every end-to-end test runs
+this path.
+
 **6. Schema evolution.**
 - `ALTER TABLE ... ADD COLUMN` shows up in the next event's Connect schema and is added with `union_by_name`.
 - pyiceberg's `upsert` then fails for existing keys (apache/iceberg-python#3105). It also stops pruning files for key
@@ -154,6 +176,7 @@ reconciles exactly.
 | `tests/test_sink_applier.py` | Against a real Iceberg catalog: atomic batches, crash mid-transaction leaves nothing, idempotent replay, out-of-order LSNs, truncate, TOAST from lake and from an old key, schema evolution incl. #3105 and default backfill, >200-key deletes, commit-conflict retry, replay filter |
 | `tests/test_review_findings.py` | Regressions from adversarial review: truncate-only batches, truncate replays, replay of the last PK-change pair, stale writers, interleaved-transaction positions, bytea/array placeholders, time columns, duplicate keys in reconcile, transaction-aligned batching |
 | `tests/test_review_v2.py` | Second review: type widening and refused type changes, infinity sentinels (snapshot and streaming), arrays and their TOAST placeholder, replays that start mid-batch, PK-change pairs split by a full poll (driving the real `run()` loop with a fake Kafka consumer), seek-on-assign, real commit fencing without mocks, exact float comparison in reconcile |
+| `tests/test_multi_partition.py` | Two partitions: a key change whose halves are in different partitions, in one batch and split across polls (through the real `run()` loop); a create waiting for a lagging old-key partition; batches closed under pairing; commit order across partitions |
 | `tests/test_maintain.py` | Maintenance interleaved with the real Applier: data, offsets and positions unchanged; a stale compaction is rejected; every referenced file survives (checked on disk, because pyiceberg caches manifest lists in memory); young files kept; dry run changes nothing; keep-last-N |
 | `tests/test_e2e.py` (Docker, CI) | The real stack: snapshot → streaming → reconcile; consumer killed 3× → reconcile; Kafka Connect SIGKILLed mid-workload → replays dropped → reconcile; maintenance, then more changes → reconcile |
 
@@ -164,8 +187,13 @@ docker compose up -d --wait && CDCLAB_E2E=1 pytest -q tests/test_e2e.py
 
 ## Limitations
 
-- **One writer per table.** Two consumers of the same topic are detected (commit conflict, then retry), but this isn't
-  designed as a multi-writer sink.
+- **One consumer per table, however many partitions.** A single consumer handles N partitions correctly (5b). Two
+  consumers splitting a topic's partitions cannot work with primary-key changes under `REPLICA IDENTITY DEFAULT`. The
+  two halves usually go to different consumers, and the delete's consumer would wait forever for a create it never
+  receives. Concurrent commits to the same table are still fenced (conflict, then retry), so a second consumer can't
+  corrupt data, only stall. Scale out across tables, not within one.
+- **Truncate with several partitions** is ordered against the events of its own batch only. A truncate must be
+  applied after every partition has caught up to it, which the lab doesn't enforce.
 - **No multi-table atomicity.** Each table is exactly-once on its own; pyiceberg has no multi-table transactions.
 - **Copy-on-write.** pyiceberg 0.12 rewrites every data file that contains a touched key. Partition or bucket by key for
   real volumes. `cdclab maintain` compacts by rewriting the whole table, so tables over 2 GiB are skipped (use Spark's

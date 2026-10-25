@@ -6,6 +6,7 @@ but only so lag shows up in monitoring; correctness never depends on them.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections import defaultdict
@@ -111,7 +112,7 @@ class Applier:
                     high[tp] = max(ev.position, high.get(tp, ev.position))
                 events.append(ev)
             pos_props = {f"{POS_PREFIX}{tp}.{p}": f"{a},{b}" for (tp, p), (a, b) in high.items()}
-            plan = compact(events).get(table) if events else None
+            plan = compact(sorted(events, key=emission_order)).get(table) if events else None
             try:
                 if plan is not None and plan.columns and t is not None and self.sink.needs_evolution(t, plan):
                     schema_changed, backfilled = 1, self.sink.evolve(t, plan)
@@ -134,6 +135,21 @@ class Applier:
             result.backfilled += backfilled
             return result
         raise RuntimeError(f"{table}: gave up after {attempts} conflicting commits")
+
+
+def emission_order(ev) -> tuple:
+    """Order events as Postgres committed them, across partitions.
+
+    Replays are filtered in (partition, offset) order, the only order in which they can be recognised. But
+    compaction needs the true order: with several partitions, the old and new key of a primary-key change hash to
+    different partitions, and sorting by partition put the create (which copies unchanged TOAST values from the old
+    row) before the insert of that old row: the consumer failed on every retry (seen on the live stack with 2
+    partitions). Snapshot reads come first (they precede streaming), then streaming events by Debezium's
+    (lastCommitLsn, lsn), which is the commit order; on a tie (the two halves of a primary-key change) the delete
+    goes first, as Debezium emits it."""
+    if ev.position is None:
+        return (0, (0, 0), 0, ev.partition, ev.offset)
+    return (1, ev.position, 0 if ev.op == "d" else 1, ev.partition, ev.offset)
 
 
 def split_trailing_transaction(records: list[Record], full: bool = False,
@@ -171,28 +187,86 @@ def applied_offsets(records: list[Record]) -> dict[tuple[str, int], int]:
     return out
 
 
-def hold_unpaired_deletes(records: list[Record]) -> tuple[list[Record], list[Record]]:
-    """(records to apply now, records to hold) so that no primary-key change is split.
+def _key_payload(raw: bytes | None):
+    if not raw:
+        return None
+    try:
+        k = json.loads(raw)
+    except ValueError:
+        return None
+    return json.dumps(k.get("payload", k) if isinstance(k, dict) else k, sort_keys=True)
 
-    Debezium emits a primary-key change as delete(old key, header __debezium.newkey) immediately followed, in the same
-    partition, by create(new key). If a partition's last change event is such a delete, its create half has not
-    arrived. The delete must not be applied alone: the create may carry TOAST placeholders that only the old row can
-    fill, and both halves share one Debezium position, so a create arriving in a later batch would be dropped as a
-    replay. Everything from the earliest such delete onward is held. This applies however the batch was cut (a poll
-    that filled up, a held transaction flushed on an idle poll, several topics in one poll)."""
-    last: dict[tuple[str, int], int] = {}
-    for i, r in enumerate(records):
-        if r[1] is not None:
-            last[(r[2], r[3])] = i
-    cuts = [i for i in last.values() if has_header(records[i][5] if len(records[i]) > 5 else None, NEWKEY_HEADER)]
-    if not cuts:
-        return records, []
-    cut = min(cuts)
-    return records[:cut], records[cut:]
+
+def _header_value(headers, name: str) -> bytes | None:
+    for k, v in headers or ():
+        if k == name:
+            return v
+    return None
+
+
+def hold_unpaired_deletes(records: list[Record], is_replay=None) -> tuple[list[Record], list[Record]]:
+    """(records to apply now, records to hold) so that no primary-key change is split across batches.
+
+    Debezium emits a primary-key change as delete(old key, header __debezium.newkey) + create(new key, header
+    __debezium.oldkey). Neither half may be applied before the other has arrived:
+
+    * the delete alone: the create may carry TOAST placeholders that only the old row can fill, and both halves
+      share one Debezium position, so a create arriving later would be dropped as a replay;
+    * the create alone: with several partitions the old key's history is in ANOTHER partition, which can lag. On
+      the live stack the create of key 95 arrived before the insert of its old key 34 had even been consumed, so
+      there was no old row to copy from. Once the delete half has arrived, everything before it in the old key's
+      partition has arrived too.
+
+    The halves are matched by key per topic, not by partition. The batch is the longest prefix of `records` that is
+    CLOSED under pairing. Judging pairs over the whole list and then cutting at the first unpaired half is not enough:
+    on the live stack that cut fell between a create (kept) and its delete (held), because the halves sit in different
+    partitions at unrelated positions in the list. So the cut is repeated on the prefix until it is stable. A prefix
+    also keeps, for each partition, everything before the delete half: the old key's whole history.
+
+    A half is identified by (topic, old key, Debezium position), the identity of one key change, so a replayed half
+    (Kafka Connect is at-least-once) pairs with whichever partner copy is present. A half that `is_replay(record)`
+    says is at or below its partition's stored position is dropped by the Applier anyway, so it waits for nothing.
+    Live failure #3: after a Connect crash the replayed create arrived early and was consumed with the ORIGINAL
+    pair, and the replayed delete then waited forever for a partner, holding back every table."""
+    ready = records
+    while (cut := _first_unpaired(ready, is_replay)) is not None:
+        ready = ready[:cut]
+    return ready, records[len(ready):]
+
+
+def _sequence(raw: bytes | None):
+    try:
+        return ((json.loads(raw) or {}).get("payload") or {}).get("source", {}).get("sequence")
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _halves(r: Record):
+    """('d' | 'c', pair identity) for a key-change half, else None."""
+    if r[1] is None or len(r) <= 5:
+        return None
+    if has_header(r[5], NEWKEY_HEADER):
+        return "d", (r[2], _key_payload(r[0]), _sequence(r[1]))
+    old = _header_value(r[5], "__debezium.oldkey")
+    if old is not None:
+        return "c", (r[2], _key_payload(old), _sequence(r[1]))
+    return None
+
+
+def _first_unpaired(records: list[Record], is_replay=None) -> int | None:
+    seen = {"d": set(), "c": set()}
+    halves = [_halves(r) for r in records]
+    for h in halves:
+        if h:
+            seen[h[0]].add(h[1])
+    for i, h in enumerate(halves):
+        if h and h[1] not in seen["c" if h[0] == "d" else "d"] and not (is_replay and is_replay(records[i])):
+            return i
+    return None
 
 
 def awaiting_create_half(records: list[Record]) -> bool:
-    """True if some partition's last change event is a primary-key-change delete whose create half has not arrived."""
+    """True if some primary-key change in `records` is missing one of its halves (in any partition)."""
     return bool(hold_unpaired_deletes(records)[1])
 
 
@@ -208,6 +282,26 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
     missing: set[str] = set()
 
     applier = Applier(sink, prefix)
+
+    def replay_check():
+        """is_replay(record) against the stored positions, read fresh for each decision (tables are cached per call)."""
+        cache: dict[str, dict] = {}
+
+        def is_replay(r: Record) -> bool:
+            table = topic_table(r[2], prefix)
+            if table not in cache:
+                t = sink.load(table)
+                cache[table] = stored_state(t.properties)[1] if t is not None else {}
+            high = cache[table].get((r[2], r[3]))
+            seq = _sequence(r[1])
+            if high is None or not seq:
+                return False
+            try:
+                a, b = json.loads(seq) if isinstance(seq, str) else seq
+                return (int(a), int(b)) <= high
+            except (TypeError, ValueError):
+                return False
+        return is_replay
 
     def on_assign(consumer, partitions):  # noqa: ARG001 - signature fixed by confluent-kafka
         for tp in partitions:
@@ -245,7 +339,7 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
             new = [(m.key(), m.value(), m.topic(), m.partition(), m.offset(), m.headers()) for m in data]
             if not new:
                 # Nothing more is coming: the held transaction is complete, except a PK change missing its create.
-                ready, held = hold_unpaired_deletes(held)
+                ready, held = hold_unpaired_deletes(held, replay_check())
                 if not ready:
                     if held and held_since is not None and time.monotonic() - held_since > 30:
                         log.warning("holding %s records: a primary-key change's create half has not arrived", len(held))
@@ -258,7 +352,7 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
             else:
                 last = time.monotonic()
                 ready, held = split_trailing_transaction(held + new, full=len(new) == batch)
-                ready, unpaired = hold_unpaired_deletes(ready)   # never a PK-change delete without its create
+                ready, unpaired = hold_unpaired_deletes(ready, replay_check())   # never half a key change
                 held = unpaired + held
             held_since = time.monotonic() if held else None
             for r in applier.apply(ready):
@@ -271,5 +365,28 @@ def run(bootstrap: str, prefix: str, topics: list[str], sink: IcebergSink, group
                 c.commit(offsets=[TopicPartition(t, p, o) for (t, p), o in applied_offsets(ready).items()],
                          asynchronous=False)
     finally:
+        if held:
+            log.warning("exiting with %s records held back; unpaired primary-key-change halves: %s", len(held),
+                        describe_unpaired(held))
         c.close()
     return applier.commits
+
+
+def describe_unpaired(records: list[Record], limit: int = 5) -> list[str]:
+    """Human-readable list of key-change halves in `records` whose partner is not there (for logs)."""
+    out = []
+    rest = list(records)
+    while rest and len(out) < limit:
+        i = _first_unpaired(rest)
+        if i is None:
+            break
+        r = rest[i]
+        try:
+            v = json.loads(r[1]).get("payload") or {}
+            op, seq = v.get("op"), (v.get("source") or {}).get("sequence")
+        except (TypeError, ValueError):
+            op, seq = "?", None
+        out.append(f"{r[2]}[{r[3]}]@{r[4]} op={op} key={_key_payload(r[0])} "
+                   f"oldkey={_key_payload(_header_value(r[5], '__debezium.oldkey'))} sequence={seq}")
+        rest = rest[i + 1:]
+    return out
