@@ -10,8 +10,21 @@ Debezium encodes logical types on top of a few physical ones; the field's `name`
     io.debezium.time.MicroTime       int64  micros since midnight      -> time64[us]
     org.apache.kafka.connect.data.Decimal  bytes base64, big-endian two's complement, scale in parameters -> decimal128
     io.debezium.data.Json / Uuid / Enum / Xml  string                  -> string
+    array (items: any of the above)  JSON list                         -> list<item>
 
 Everything is decoded exactly: no float round-trips for decimals or timestamps.
+
+Postgres `infinity` / `-infinity` in timestamp, timestamptz and date columns become the largest / smallest value
+Python can hold (datetime.max / datetime.min, date.max / date.min); reconcile loads the source the same way. Debezium
+encodes them as sentinels, and they differ by type (observed on Debezium 3.7.0.Final, not all as documented):
+
+    MicroTimestamp  Long.MAX_VALUE / Long.MIN_VALUE
+    Timestamp       9223372036825200000 / -9223372036832400000 (the documented values)
+    ZonedTimestamp  "infinity" / "-infinity"
+    Date            2146033979 / -2147472691 days when streaming, but -622191234 / -625821272 in the initial
+                    snapshot (+infinity comes out negative). All four are far outside Postgres' date range.
+
+Any other value outside Python's range (Postgres allows years up to 294276) raises instead of being clamped.
 """
 from __future__ import annotations
 
@@ -56,25 +69,60 @@ def _decimal_decoder(scale: int):
     return decode
 
 
+POS_INF_TS, NEG_INF_TS = dt.datetime.max, dt.datetime.min
+POS_INF_DATE, NEG_INF_DATE = dt.date.max, dt.date.min
+_INF_TS = {2**63 - 1: POS_INF_TS, -2**63: NEG_INF_TS,
+           9223372036825200000: POS_INF_TS, -9223372036832400000: NEG_INF_TS}
+_INF_DATE = {2146033979: POS_INF_DATE, -2147472691: NEG_INF_DATE,      # streaming (pgoutput)
+             -622191234: POS_INF_DATE, -625821272: NEG_INF_DATE}       # snapshot (JDBC): +infinity is NEGATIVE
+
+
+def _out_of_range(v, what: str):
+    return ValueError(f"{what} {v!r} is outside the range Python can represent (years 1-9999) and is not one of "
+                      "Debezium's infinity sentinels")
+
+
 def _days(v):
-    return None if v is None else EPOCH_DATE + dt.timedelta(days=v)
+    if v is None:
+        return None
+    if v in _INF_DATE:
+        return _INF_DATE[v]
+    try:
+        return EPOCH_DATE + dt.timedelta(days=v)
+    except OverflowError:
+        raise _out_of_range(v, "date (days since epoch)") from None
 
 
-def _micros(v):
-    return None if v is None else EPOCH + dt.timedelta(microseconds=v)
+def _epoch_offset(unit: str):
+    def decode(v):
+        if v is None:
+            return None
+        if v in _INF_TS:
+            return _INF_TS[v]
+        try:
+            return EPOCH + dt.timedelta(**{unit: v})
+        except OverflowError:
+            raise _out_of_range(v, f"timestamp ({unit} since epoch)") from None
+    return decode
 
 
-def _millis(v):
-    return None if v is None else EPOCH + dt.timedelta(milliseconds=v)
+_micros = _epoch_offset("microseconds")
+_millis = _epoch_offset("milliseconds")
 
 
 def _nanos(v):
-    return None if v is None else EPOCH + dt.timedelta(microseconds=v // 1000)
+    if v is None:
+        return None
+    return _INF_TS[v] if v in _INF_TS else _micros(v // 1000)
 
 
 def _zoned(v):
     if v is None:
         return None
+    if v == "infinity":
+        return POS_INF_TS.replace(tzinfo=dt.timezone.utc)
+    if v == "-infinity":
+        return NEG_INF_TS.replace(tzinfo=dt.timezone.utc)
     return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).astimezone(dt.timezone.utc)
 
 
@@ -84,9 +132,17 @@ def _micro_time(v):
     return (dt.datetime.min + dt.timedelta(microseconds=v)).time()
 
 
+def _list_decoder(item: Callable[[Any], Any]):
+    def decode(v):
+        return None if v is None else [None if x is None else item(x) for x in v]
+    return decode
+
+
 _PHYSICAL = {
     "int8": pa.int8(), "int16": pa.int16(), "int32": pa.int32(), "int64": pa.int64(),
-    "float32": pa.float32(), "float64": pa.float64(), "boolean": pa.bool_(), "string": pa.string(), "bytes": pa.binary(),
+    # JsonConverter writes FLOAT32 / FLOAT64 as "float" / "double" (checked on the live stack)
+    "float": pa.float32(), "double": pa.float64(), "float32": pa.float32(), "float64": pa.float64(),
+    "boolean": pa.bool_(), "string": pa.string(), "bytes": pa.binary(),
 }
 
 
@@ -136,6 +192,11 @@ def _column(field: dict) -> Column:
     if typ in _PHYSICAL:
         decode = (lambda v: None if v is None else base64.b64decode(v)) if typ == "bytes" else _ident
         return Column(name, _PHYSICAL[typ], decode, optional)
+    if typ == "array" and isinstance(field.get("items"), dict):
+        item = _column({**field["items"], "field": f"{name}.element"})
+        if isinstance(item.arrow, pa.ListType):
+            raise ValueError(f"column {name!r}: nested arrays are not supported")
+        return Column(name, pa.list_(item.arrow), _list_decoder(item.decode), optional)
     raise ValueError(f"column {name!r}: unsupported Connect type {typ!r} ({logical})")
 
 

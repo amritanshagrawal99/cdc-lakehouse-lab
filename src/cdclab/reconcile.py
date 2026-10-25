@@ -6,9 +6,13 @@ in the CLI does that by waiting until the lake's stored offsets reach the end of
 from __future__ import annotations
 
 import datetime as dt
+import math
+import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal
+
+FLOAT4, FLOAT4_ARRAY = 700, 1021   # Postgres type OIDs
 
 
 @dataclass
@@ -41,13 +45,27 @@ class Diff:
 
 
 def normalise(v):
+    """Make equal values compare equal. Comparison is otherwise EXACT: Decimal equality already ignores trailing
+    zeros, and source floats are loaded at the precision the lake stores (see source_rows), so no tolerance is
+    needed and none can hide a real difference."""
     if isinstance(v, Decimal):
-        return v.normalize() if v == v.to_integral_value() else v.quantize(Decimal(1).scaleb(v.as_tuple().exponent))
+        return v if v.is_finite() else ("non-finite", str(v))   # NaN != NaN, and NaN breaks quantize
+    if isinstance(v, float):
+        return ("non-finite", "NaN") if math.isnan(v) else v
     if isinstance(v, dt.datetime) and v.tzinfo is not None:
         return v.astimezone(dt.timezone.utc)
-    if isinstance(v, float):
-        return round(v, 9)
+    if isinstance(v, list):
+        return [normalise(x) for x in v]
     return v
+
+
+def _float32(v):
+    """A Postgres real at the precision Iceberg stores it (float32), as the double Python reads back."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [_float32(x) for x in v]
+    return struct.unpack("f", struct.pack("f", v))[0]
 
 
 def compare(table: str, key: list[str], source_rows: list[dict], lake_rows: list[dict], columns: list[str] | None = None) -> Diff:
@@ -69,10 +87,45 @@ def compare(table: str, key: list[str], source_rows: list[dict], lake_rows: list
     return d
 
 
+def _source_loaders(cur) -> None:
+    """Load source values in the form Debezium sends them to the lake:
+    * json / jsonb / uuid as text (Debezium sends Postgres' own text form; psycopg would parse them);
+    * timestamp / timestamptz / date infinity as the max / min Python value (as connect_schema decodes them;
+      psycopg would raise)."""
+    from psycopg.types.datetime import DateLoader, TimestampLoader, TimestamptzLoader
+    from psycopg.types.string import TextLoader
+
+    def infinite(base, pos, neg):
+        class Loader(base):
+            def load(self, data):
+                raw = bytes(data)
+                if raw == b"infinity":
+                    return pos
+                if raw == b"-infinity":
+                    return neg
+                return super().load(data)
+        return Loader
+
+    utc = dt.timezone.utc
+    for name in ("json", "jsonb", "uuid"):
+        cur.adapters.register_loader(name, TextLoader)
+    cur.adapters.register_loader("timestamp", infinite(TimestampLoader, dt.datetime.max, dt.datetime.min))
+    cur.adapters.register_loader("timestamptz", infinite(TimestamptzLoader, dt.datetime.max.replace(tzinfo=utc),
+                                                         dt.datetime.min.replace(tzinfo=utc)))
+    cur.adapters.register_loader("date", infinite(DateLoader, dt.date.max, dt.date.min))
+
+
 def source_rows(conn, table: str) -> tuple[list[str], list[dict]]:
-    cur = conn.execute(f"SELECT * FROM {table}")
+    cur = conn.cursor()
+    _source_loaders(cur)
+    cur.execute(f"SELECT * FROM {table}")
     names = [c.name for c in cur.description]
-    return names, [dict(zip(names, r, strict=True)) for r in cur.fetchall()]
+    real = {c.name for c in cur.description if c.type_code in (FLOAT4, FLOAT4_ARRAY)}
+    rows = [dict(zip(names, r, strict=True)) for r in cur.fetchall()]
+    for r in rows:
+        for n in real:
+            r[n] = _float32(r[n])
+    return names, rows
 
 
 def primary_key(conn, table: str) -> list[str]:

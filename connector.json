@@ -12,7 +12,7 @@
     "slot.name": "lab_slot",
     "publication.name": "lab_publication",
     "publication.autocreate.mode": "filtered",
-    "table.include.list": "public.accounts,public.orders",
+    "table.include.list": "public.accounts,public.orders,public.edge_types",
     "snapshot.mode": "initial",
     "decimal.handling.mode": "precise",
     "time.precision.mode": "adaptive",

@@ -12,7 +12,7 @@ import urllib.request
 from pathlib import Path
 
 DSN = "postgresql://lab:lab@localhost:55432/lab"
-TABLES = ["public.accounts", "public.orders"]
+TABLES = ["public.accounts", "public.orders", "public.edge_types"]
 
 
 def catalog(lake_dir: str):

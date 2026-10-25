@@ -56,6 +56,54 @@ def key_filter(key_names: tuple[str, ...], keys: list[tuple]) -> BooleanExpressi
     return parts[0] if len(parts) == 1 else Or(*parts)
 
 
+def _family(t: pa.DataType):
+    """Arrow type as Iceberg sees it: small ints are int, large_string is string, and so on."""
+    if pa.types.is_integer(t):
+        return ("int", 32 if t.bit_width <= 32 else 64)
+    if pa.types.is_floating(t):
+        return ("float", t.bit_width)
+    if pa.types.is_decimal(t):
+        return ("decimal", t.precision, t.scale)
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        return ("string",)
+    if pa.types.is_binary(t) or pa.types.is_large_binary(t):
+        return ("binary",)
+    if pa.types.is_list(t) or pa.types.is_large_list(t):
+        return ("list", t.value_type)
+    if pa.types.is_timestamp(t):
+        return ("timestamp", t.unit, t.tz is not None)
+    return ("other", str(t))
+
+
+def fits(source: pa.DataType, lake: pa.DataType) -> bool:
+    """Can every value of `source` be stored in a `lake` column unchanged (same type, or a wider one)?"""
+    s, k = _family(source), _family(lake)
+    if s[0] != k[0]:
+        return False
+    if s[0] in ("int", "float"):
+        return s[1] <= k[1]
+    if s[0] == "decimal":
+        return s[2] == k[2] and s[1] <= k[1]
+    if s[0] == "list":
+        return fits(s[1], k[1])
+    return s == k
+
+
+def promotable(source: pa.DataType, lake: pa.DataType) -> bool:
+    """Can Iceberg widen the `lake` column in place so that it fits `source` (int -> long, float -> double,
+    decimal precision with the same scale)? A decimal SCALE change is not: union_by_name silently ignores it."""
+    s, k = _family(source), _family(lake)
+    if s[0] != k[0]:
+        return False
+    if s[0] in ("int", "float"):
+        return True
+    if s[0] == "decimal":
+        return s[2] == k[2]
+    if s[0] == "list":
+        return fits(s[1], k[1]) or promotable(s[1], k[1])
+    return s == k
+
+
 class IcebergSink:
     def __init__(self, catalog, namespace: str = "cdc"):
         self.catalog = catalog
@@ -89,11 +137,22 @@ class IcebergSink:
     # ------------------------------------------------------------------ schema
 
     def needs_evolution(self, table: Table, plan: TablePlan) -> bool:
-        current = {f.name for f in table.schema().fields}
-        return any(c.name not in current for c in plan.columns)
+        """True if the plan has columns the table lacks, or a column whose values the table's type cannot hold."""
+        current = {f.name: f.type for f in table.schema().as_arrow()}
+        return any(c.name not in current or not fits(c.arrow, current[c.name]) for c in plan.columns)
 
     def evolve(self, table: Table, plan: TablePlan) -> int:
-        """Add the plan's new columns in their own commit, backfilling database defaults. Returns rows backfilled."""
+        """Add the plan's new columns and widen changed ones, in their own commit, backfilling database defaults.
+        Returns rows backfilled. Raises for a type change Iceberg cannot apply in place."""
+        current = {f.name: f.type for f in table.schema().as_arrow()}
+        bad = [(c.name, current[c.name], c.arrow) for c in plan.columns
+               if c.name in current and not fits(c.arrow, current[c.name]) and not promotable(c.arrow, current[c.name])]
+        if bad:
+            detail = "; ".join(f"{n}: lake {a} -> source {b}" for n, a, b in bad)
+            raise RuntimeError(f"{plan.table}: the source changed column types in a way Iceberg cannot apply in place "
+                               f"({detail}). Iceberg only widens int -> long, float -> double and decimal precision "
+                               "(same scale). Migrate the lake table yourself (e.g. add a new column, or re-snapshot "
+                               "into a new table), then restart the consumer.")
         schema = arrow_schema(plan.columns)
         new_cols = [c for c in plan.columns if c.name not in {f.name for f in table.schema().fields}]
         defaults = {c.name: c.default for c in new_cols if c.default is not None}
@@ -101,6 +160,10 @@ class IcebergSink:
         with table.transaction() as tx:
             with tx.update_schema() as us:   # the context manager is what stages the change in the transaction
                 us.union_by_name(schema)
+            after = {f.name: f.type for f in tx.table_metadata.schema().as_arrow()}
+            still = [c.name for c in plan.columns if not fits(c.arrow, after[c.name])]
+            if still:   # raising inside the transaction aborts it: nothing is committed
+                raise RuntimeError(f"{plan.table}: schema evolution did not widen {still}; refusing to write")
             if existing:
                 # Postgres gave every existing row the default, but Debezium emits no events for them.
                 widened = tx.table_metadata.schema().as_arrow()

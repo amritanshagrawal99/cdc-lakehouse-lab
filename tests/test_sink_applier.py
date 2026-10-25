@@ -63,10 +63,13 @@ def test_failed_transaction_leaves_no_partial_state(sink, monkeypatch):
 
 
 def test_out_of_order_lsn_is_not_skipped(sink):
-    # Interleaved transactions: T2 (lsn 200) commits first and is emitted first; T1 (lsn 150) commits later.
-    # Offsets, not LSNs, decide what has been applied, so T1's change is applied.
-    Applier(sink, "lab").apply([rec("c", 0, after=row(1), lsn=200), rec("c", 1, after=row(2), lsn=150)])
-    assert set(lake(sink)) == {1, 2}
+    # Interleaved transactions: T2 (lsn 2000) commits first and is emitted first; T1 (lsn 1500) commits later.
+    # Its raw lsn is below the stored high-water mark, but its (lastCommitLsn, lsn) position is above it, so it is
+    # applied. Separate batches, so the second really is compared with a stored position.
+    a = Applier(sink, "lab")
+    a.apply([rec("c", 0, after=row(1), lsn=2000, seq=(100, 2000))])
+    a.apply([rec("c", 1, after=row(2), lsn=1500, seq=(2050, 1500))])
+    assert set(lake(sink)) == {1, 2} and a.skipped_replays == 0
 
 
 def test_truncate_then_insert(sink):

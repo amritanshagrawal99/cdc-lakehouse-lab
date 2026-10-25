@@ -2,7 +2,7 @@
 import datetime as dt
 
 import pytest
-from debezium_fixtures import ROW_FIELDS, dec, record, row, truncate
+from debezium_fixtures import ROW_FIELDS, record, row, truncate
 from pyiceberg.catalog.sql import SqlCatalog
 
 from cdclab.connect_schema import column
@@ -40,13 +40,13 @@ def test_truncate_only_batch_is_applied(sink):
 
 def test_truncate_has_a_position_so_its_replay_is_dropped(sink):
     k, v, *_ = truncate(offset=1)
-    assert parse(k, v, "lab.public.accounts", 0, 1) is not None
     a = Applier(sink, "lab")
     a.apply([rec("c", 0, after=row(1), seq=(10, 100))])
     import json
     tv = json.loads(v)
     tv["payload"]["source"]["sequence"] = json.dumps(["20", "200"])
     tv = json.dumps(tv).encode()
+    assert parse(k, tv, "lab.public.accounts", 0, 1).position == (20, 200)
     a.apply([(None, tv, "lab.public.accounts", 0, 1), rec("c", 2, after=row(2), seq=(30, 300))])
     assert set(lake(sink)) == {2}
     a.apply([(None, tv, "lab.public.accounts", 0, 3)])   # Kafka Connect replays the truncate at a new offset
@@ -125,10 +125,6 @@ def test_partial_batch_holds_trailing_transaction_and_pk_delete():
     d = (*d[:5], [("__debezium.newkey", b'{"id": 2}')])
     assert awaiting_create_half([rec("c", 4, after=row(3), tx=6), d, TOMBSTONE])
     assert not awaiting_create_half([d, rec("c", 6, after=row(2), tx=7, old_key={"id": 1})])
-
-
-def test_decimal_fixture_roundtrip():
-    assert dec("-0.01") and dec("123.45")
 
 
 def test_kafka_commit_covers_only_applied_records():
